@@ -38,9 +38,12 @@ section.card{background:var(--card);border:1px solid var(--line);border-radius:1
 .card h2 .tally{font-size:12px;font-weight:400;opacity:.9}
 .card .body{padding:12px}
 .row{display:flex;gap:8px;align-items:flex-end;margin-bottom:10px}
-.field{flex:1}
+.field{flex:1;min-width:0}
 .field label{display:block;font-size:11px;color:var(--sub);margin-bottom:3px}
-input[type=text],input[type=number],input[type=date],select{width:100%;padding:12px 10px;font-size:17px;border:1.5px solid var(--line);border-radius:8px;background:#FDFCF9;color:var(--ink)}
+input[type=text],input[type=number],input[type=date],select{width:100%;max-width:100%;min-width:0;box-sizing:border-box;padding:12px 10px;font-size:17px;border:1.5px solid var(--line);border-radius:8px;background:#FDFCF9;color:var(--ink)}
+/* iOSのSafariは日付入力とセレクトに独自の最小幅を持たせるため、明示的に打ち消す */
+input[type=date]{-webkit-appearance:none;appearance:none;display:block;height:48px;line-height:normal}
+select{-webkit-appearance:none;appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--sub) 50%),linear-gradient(135deg,var(--sub) 50%,transparent 50%);background-position:calc(100% - 16px) 52%,calc(100% - 11px) 52%;background-size:5px 5px,5px 5px;background-repeat:no-repeat;padding-right:30px}
 input:disabled,select:disabled{background:#EFEDE4;color:#8A8578}
 input:focus,select:focus{outline:2px solid var(--green);border-color:var(--green)}
 .unit{font-size:12px;color:var(--sub);padding-bottom:14px;min-width:24px}
@@ -75,7 +78,10 @@ body.locked .mini,body.locked .addbar{display:none}
 body.locked .confirmed{display:block}
 /* 見積 */
 .opts{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:14px}
-.opts .row{margin-bottom:8px}
+.opts .row{margin-bottom:8px;flex-wrap:wrap}
+/* 狭い画面ではセレクトを1行使い、補足文はその下に回す */
+.opts .row>.field{flex:1 1 160px;max-width:none!important}
+.opts .row>.optnote,.opts .row>#prTargetNote{flex:1 1 100%;padding-bottom:0!important}
 .opts .chk{display:flex;align-items:center;gap:8px;padding:8px 0;font-size:14px;font-weight:700}
 .opts .chk input{width:22px;height:22px;accent-color:var(--green)}
 .optnote{font-size:11px;color:var(--sub)}
@@ -151,6 +157,22 @@ body.locked .confirmed{display:block}
       </div>
       <div id="caseList" style="display:none;margin-top:10px"></div>
       <p class="hint">入力は自動で下書き保存されます。案件として残すときは「保存」。データはこの端末の中だけに保存されます。週1回の「書き出し」でのバックアップをおすすめします。</p>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>📷 写真から自動入力(AI画像認識) <span class="tally" id="aiStatus"></span></h2>
+    <div class="body">
+      <div class="row">
+        <div class="field"><label>画像認識サーバーURL(初回のみ設定)</label>
+          <input type="text" id="gasUrl" placeholder="https://script.google.com/macros/s/.../exec" oninput="saveGasUrl()" class="lockable"></div>
+      </div>
+      <div class="addbar">
+        <button onclick="document.getElementById('aiPhotoInput').click()">📷 写真を選択して読み取る</button>
+      </div>
+      <input type="file" id="aiPhotoInput" accept="image/*" capture="environment" style="display:none" onchange="recognizePhoto(this)">
+      <div id="aiPreview" style="display:none;margin-top:10px"></div>
+      <p class="hint">立面図全体を1枚で撮っても、面ごとに何回かに分けて撮っても大丈夫です。撮るたびに読み取り結果が下に追加され、内容を確認してから「取り込む」を押すまでは反映されません。</p>
     </div>
   </section>
 
@@ -334,10 +356,45 @@ body.locked .confirmed{display:block}
 
 <script>
 /* ---------- 状態(メモリ上のみ・試作) ---------- */
+/* ============ ファイル保存(iOS対応) ============ */
+// iOSはホーム画面アプリからのダウンロードが機能しないため、共有シート経由で保存する。
+// PC・Androidは従来どおりダウンロードする。
+const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent)
+  || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+async function saveBlob(blob, filename){
+  if(IS_IOS && navigator.share){
+    try{
+      const file = new File([blob], filename, {type: blob.type});
+      if(!navigator.canShare || navigator.canShare({files:[file]})){
+        await navigator.share({files:[file], title:filename});
+        return true;
+      }
+    }catch(e){
+      if(e && e.name === 'AbortError') return true;   // ユーザーが共有をキャンセルしただけ
+      // 共有に失敗した場合は下のダウンロード方式にフォールバック
+    }
+  }
+  try{
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; a.rel = 'noopener';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url), 10000);
+    return true;
+  }catch(e){
+    alert('ファイルの保存に失敗しました: ' + e.message);
+    return false;
+  }
+}
+
 /* ============ バージョン表示・更新履歴 ============ */
-const APP_VERSION = '1.7.0';
-const APP_UPDATED = '2026-07-17';
+const APP_VERSION = '1.8.3';
+const APP_UPDATED = '2026-07-24';
 const CHANGELOG = [
+  {ver:'1.8.3', date:'2026-07-24', notes:['iPhoneで出力ボタンを押しても何も起きない不具合を修正(共有シート経由で保存するよう変更)']},
+  {ver:'1.8.2', date:'2026-07-24', notes:['Excelがファイルを開けない・修復を求める不具合を根本修正(calcChainの不整合を解消)']},
+  {ver:'1.8.1', date:'2026-07-24', notes:['iPhoneで商談日の入力欄が画面から切れる不具合を修正','iPhoneで目標単価の選択欄が潰れて表示されない不具合を修正','狭い画面では設定の補足文を下の行に折り返すよう調整']},
+  {ver:'1.8.0', date:'2026-07-18', notes:['AI画像認識機能を追加(GAS経由でClaude APIを呼び出し、立面図の写真から壁面・窓・加算面を自動入力)','手動入力と併用できるプレビュー確認方式']},
   {ver:'1.7.0', date:'2026-07-17', notes:['Excel出力でMicrosoft Excelが「内容に問題」と警告する不具合を修正(XML宣言の付与漏れ)']},
   {ver:'1.6.0', date:'2026-07-16', notes:['「最新版を取得し直す」ボタンを追加(不具合時に自分で直せるように)']},
   {ver:'1.5.0', date:'2026-07-16', notes:['ヘッダーにバージョン表示・更新履歴を追加']},
@@ -778,6 +835,87 @@ function showPage(x){
   const f=document.getElementById('feeRate');
   for(let i=1;i<=100;i++){const o=document.createElement('option');o.value=i;o.textContent=i+' %';if(i===10)o.selected=true;f.appendChild(o);}
 })();
+/* ============ AI画像認識(GAS経由) ============ */
+function saveGasUrl(){
+  if(lsOK()) localStorage.setItem('mv_gasUrl', document.getElementById('gasUrl').value.trim());
+}
+function loadGasUrl(){
+  if(lsOK()){
+    const u=localStorage.getItem('mv_gasUrl');
+    if(u) document.getElementById('gasUrl').value=u;
+  }
+}
+function fileToBase64(file){
+  return new Promise((resolve,reject)=>{
+    const r=new FileReader();
+    r.onload=()=>resolve(r.result.split(',')[1]);
+    r.onerror=reject;
+    r.readAsDataURL(file);
+  });
+}
+async function recognizePhoto(inp){
+  const file=inp.files[0]; if(!file)return;
+  const url=document.getElementById('gasUrl').value.trim();
+  if(!url){ alert('画像認識サーバーのURLを先に入力してください。'); inp.value=''; return; }
+  const statusEl=document.getElementById('aiStatus');
+  statusEl.textContent='読み取り中…';
+  try{
+    const b64=await fileToBase64(file);
+    const resp=await fetch(url,{
+      method:'POST',
+      headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body:JSON.stringify({image:b64, mimeType:file.type||'image/jpeg'})
+    });
+    const json=await resp.json();
+    if(json.error){ throw new Error(json.error + (json.raw?('\n\n受信内容: '+json.raw.slice(0,200)):'')); }
+    showAiPreview(json.data||{});
+  }catch(err){
+    alert('読み取りに失敗しました:\n'+err.message);
+  }finally{
+    statusEl.textContent='';
+    inp.value='';
+  }
+}
+let aiPending=null;
+function showAiPreview(data){
+  aiPending=data;
+  const wallLabel={rect:'四角形',tri:'三角形',trap:'台形'};
+  const addLabel={balc:'バルコニー',sode:'袖',pillar:'柱'};
+  const walls_=data.walls||[], wins_=data.windows||[], adds_=data.adds||[];
+  if(!walls_.length && !wins_.length && !adds_.length){
+    document.getElementById('aiPreview').innerHTML='<div class="hint">この写真からは数値を読み取れませんでした。別の角度・明るさで撮り直すか、面ごとに分けて撮ってみてください。</div>';
+    document.getElementById('aiPreview').style.display='block';
+    return;
+  }
+  let html='<div class="rev"><h3>読み取り結果(確認してください)</h3><table>';
+  walls_.forEach(w=>html+=`<tr><td>壁面(${esc(w.direction)||'他'})</td><td>${wallLabel[w.type]||esc(w.type)}</td><td class="r num">${(w.dims||[]).join(' / ')} cm</td></tr>`);
+  wins_.forEach(w=>html+=`<tr><td>窓(${esc(w.direction)||'他'})</td><td></td><td class="r num">たて${w.h} × よこ${w.w} cm</td></tr>`);
+  adds_.forEach(a=>html+=`<tr><td>${addLabel[a.type]||esc(a.type)}(${esc(a.direction)||'他'})</td><td></td><td class="r num">たて${a.h} × よこ${a.w} cm</td></tr>`);
+  html+='</table></div><div style="display:flex;gap:8px;margin-top:8px">'
+    +'<button onclick="applyAiResult()" class="casebtn" style="border-color:var(--green)">この内容を取り込む</button>'
+    +'<button onclick="cancelAiResult()" class="casebtn" style="color:var(--ng);border-color:var(--ng)">キャンセル</button></div>';
+  const box=document.getElementById('aiPreview');
+  box.innerHTML=html; box.style.display='block';
+}
+function cancelAiResult(){ aiPending=null; document.getElementById('aiPreview').style.display='none'; }
+function applyAiResult(){
+  if(!aiPending)return;
+  (aiPending.walls||[]).forEach(w=>{
+    if(!wallDefs[w.type])return;
+    walls.push({id:++uid, type:w.type, dir:w.direction||'他', dims:(w.dims||[]).map(String)});
+  });
+  (aiPending.windows||[]).forEach(w=>{
+    wins.push({id:++uid, dir:w.direction||'他', h:String(w.h??''), w:String(w.w??'')});
+  });
+  (aiPending.adds||[]).forEach(a=>{
+    if(!addDefs[a.type])return;
+    adds.push({id:++uid, type:a.type, dir:a.direction||'他', h:String(a.h??''), w:String(a.w??'')});
+  });
+  cancelAiResult();
+  render();
+  showToast('読み取り結果を取り込みました', null, 2000);
+}
+
 addWall('rect'); addWin();
 </script>
 
@@ -984,6 +1122,26 @@ async function exportExcel(){
     }
     zip.file('xl/workbook.xml',wbStr);
 
+    /* --- calcChain.xml(数式の計算順序メモ)を削除 ---
+       ツールは数式セルに計算済みの値を直接書き込むため、このメモと実際の中身が
+       食い違い、Excelが「一部の内容に問題が見つかりました」と判定する原因になる。
+       このファイルはExcelが開くときに自動で再生成するので、消して問題ない。 */
+    if(zip.file('xl/calcChain.xml')){
+      zip.remove('xl/calcChain.xml');
+      const ctPath='[Content_Types].xml';
+      if(zip.file(ctPath)){
+        let ct=await zip.file(ctPath).async('string');
+        ct=ct.replace(/<Override[^>]*calcChain\.xml[^>]*\/>/g,'');
+        zip.file(ctPath,ct);
+      }
+      const relPath='xl/_rels/workbook.xml.rels';
+      if(zip.file(relPath)){
+        let rl=await zip.file(relPath).async('string');
+        rl=rl.replace(/<Relationship[^>]*calcChain\.xml[^>]*\/>/g,'');
+        zip.file(relPath,rl);
+      }
+    }
+
     const editedDocs={};
     async function edit(sheetName,fn){
       const path=nameToPath[sheetName];
@@ -1119,11 +1277,7 @@ async function exportExcel(){
     const blob=await zip.generateAsync({type:'blob',mimeType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
     const name=(t('cname')||'お客様').replace(/[\s\u3000]/g,'');
     const d=(t('cdate')||new Date().toISOString().slice(0,10)).replace(/-/g,'');
-    const a=document.createElement('a');
-    a.href=URL.createObjectURL(blob);
-    a.download=name+'様_AS_'+d+'.xlsx';
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+    await saveBlob(blob, name+'様_AS_'+d+'.xlsx');
   }catch(err){
     alert('出力エラー: '+err.message);
   }finally{
@@ -1357,11 +1511,7 @@ function b64ToBlob(b64){
   return new Blob([arr], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
 }
 function downloadTemplate(){
-  const blob=b64ToBlob(activeTemplateB64());
-  const a=document.createElement('a');
-  a.href=URL.createObjectURL(blob); a.download='見積テンプレート.xlsx';
-  document.body.appendChild(a);a.click();a.remove();
-  setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+  saveBlob(b64ToBlob(activeTemplateB64()), '見積テンプレート.xlsx');
 }
 function importTemplate(inp){
   const f=inp.files[0]; if(!f)return;
@@ -1440,10 +1590,7 @@ function exportCase(){
   const blob=new Blob([JSON.stringify(s,null,1)],{type:'application/json'});
   const n=((s.fields.cname||'案件').replace(/[\s\u3000]/g,''))||'案件';
   const d=(s.fields.cdate||new Date().toISOString().slice(0,10)).replace(/-/g,'');
-  const a=document.createElement('a');
-  a.href=URL.createObjectURL(blob); a.download=`見積案件_${n}_${d}.json`;
-  document.body.appendChild(a);a.click();a.remove();
-  setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+  saveBlob(blob, `見積案件_${n}_${d}.json`);
 }
 function importCase(inp){
   const f=inp.files[0]; if(!f)return;
@@ -1470,6 +1617,7 @@ window.addEventListener('load',()=>{
     }catch(e){}
   }
   updateTmplStatus();
+  loadGasUrl();
 });
 /* Service Worker 登録と更新通知 */
 if('serviceWorker' in navigator && location.protocol==='https:'){
