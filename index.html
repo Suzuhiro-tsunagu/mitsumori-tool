@@ -388,13 +388,16 @@ async function saveBlob(blob, filename){
 }
 
 /* ============ バージョン表示・更新履歴 ============ */
-const APP_VERSION = '1.8.3';
+const APP_VERSION = '1.8.6';
 const APP_UPDATED = '2026-07-29';
 const CHANGELOG = [
-  {ver:'1.8.3', date:'2026-07-29', notes:['iPhoneで出力ボタンを押しても何も起きない不具合を修正(共有シート経由で保存するよう変更)']},
-  {ver:'1.8.2', date:'2026-07-29', notes:['Excelがファイルを開けない・修復を求める不具合を根本修正(calcChainの不整合を解消)']},
-  {ver:'1.8.1', date:'2026-07-29', notes:['iPhoneで商談日の入力欄が画面から切れる不具合を修正','iPhoneで目標単価の選択欄が潰れて表示されない不具合を修正','狭い画面では設定の補足文を下の行に折り返すよう調整']},
-  {ver:'1.8.0', date:'2026-07-18', notes:['AI画像認識機能を追加(GAS経由でClaude APIを呼び出し、立面図の写真から壁面・窓・加算面を自動入力)','手動入力と併用できるプレビュー確認方式']},
+  {ver:'1.8.6', date:'2026-07-29', notes:['出力Excelにツールの入力値が反映されない(古い数字が表示される)不具合を修正。全数式セルの表示値をツールの計算結果で更新するようにした']},
+  {ver:'1.8.5', date:'2026-07-29', notes:['Excelの金額・お客様名などが白紙になる不具合を修正(数式の計算結果を消しすぎていた)']},
+  {ver:'1.8.4', date:'2026-07-29', notes:['Excelが正しく表示されない不具合を修正(XML宣言が二重に付いていた)']},
+  {ver:'1.8.3', date:'2026-07-29', notes:['iPhoneで出力ボタンを押しても何も起きない不具合を修正(共有シート経由で保存)']},
+  {ver:'1.8.2', date:'2026-07-29', notes:['Excelがファイルを開けない不具合を修正(calcChainの不整合を解消)']},
+  {ver:'1.8.1', date:'2026-07-29', notes:['iPhoneでの表示崩れを修正(商談日・目標単価の入力欄)']},
+  {ver:'1.8.0', date:'2026-07-18', notes:['AI画像認識機能を追加(写真から壁面・窓・加算面を自動入力)']},
   {ver:'1.7.0', date:'2026-07-17', notes:['Excel出力でMicrosoft Excelが「内容に問題」と警告する不具合を修正(XML宣言の付与漏れ)']},
   {ver:'1.6.0', date:'2026-07-16', notes:['「最新版を取得し直す」ボタンを追加(不具合時に自分で直せるように)']},
   {ver:'1.5.0', date:'2026-07-16', notes:['ヘッダーにバージョン表示・更新履歴を追加']},
@@ -1097,8 +1100,11 @@ async function exportExcel(){
     const zip=await JSZip.loadAsync(activeTemplateB64(),{base64:true});
     const dp=new DOMParser(), xs=new XMLSerializer();
     function serializeXml(doc){
-      // XMLSerializerは既定でXML宣言(<?xml ...?>)を出力しないため、Excelが「内容に問題」と警告する原因になる。明示的に付与する。
-      return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' + xs.serializeToString(doc);
+      // XMLSerializerは既定でXML宣言を出力しない場合と、元から宣言が含まれる場合があり、
+      // そのまま前置きすると宣言が二重になりExcelが破損と判定する。既存の宣言を必ず除いてから1つだけ付ける。
+      let s = xs.serializeToString(doc);
+      s = s.replace(/^\s*<\?xml[^>]*\?>\s*/i, '');
+      return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' + s;
     }
     const wbXml=await zip.file('xl/workbook.xml').async('string');
     const relXml=await zip.file('xl/_rels/workbook.xml.rels').async('string');
@@ -1255,22 +1261,179 @@ async function exportExcel(){
     await put('pr_disc', -pc.pr.disc);
     await put('cat_disc', pc.cat.hasu?-pc.cat.hasu:'');
 
-    /* --- 全シートの数式セルから古い計算結果(キャッシュ)を除去し、開いたら必ず再計算させる --- */
-    const NS_MAIN='http://schemas.openxmlformats.org/spreadsheetml/2006/main';
-    for(const sheetName in nameToPath){
-      const path=nameToPath[sheetName];
-      if(!zip.file(path))continue;
-      const doc = editedDocs[path] || dp.parseFromString(await zip.file(path).async('string'),'application/xml');
-      const fEls=[...doc.getElementsByTagNameNS(NS_MAIN,'f')];
-      let touched=false;
-      fEls.forEach(fEl=>{
-        const cell=fEl.parentNode;
-        const vEl=[...cell.children].find(c=>c.localName==='v');
-        if(vEl){ cell.removeChild(vEl); touched=true; }
-      });
-      if(touched || editedDocs[path]){
-        zip.file(path, serializeXml(doc));
+    /* --- 数式セルのキャッシュ値を、ツールが計算した最新値に更新する ---
+       環境によってはExcel/LibreOfficeが開いても再計算しないため、
+       数式(<f>)は残したまま表示値(<v>)だけを正しい値に書き換える。
+       これで開いた瞬間から新しい数字が表示され、Excel上で編集すれば数式が生きて連動する。 */
+    function setCache(doc, ref, val, isStr){
+      const cell=findCell(doc, ref); if(!cell)return;
+      if(![...cell.children].some(c=>c.localName==='f'))return;   // 数式セルのみ対象
+      const vOld=[...cell.children].find(c=>c.localName==='v');
+      if(vOld)cell.removeChild(vOld);
+      const ns=doc.documentElement.namespaceURI;
+      const vEl=doc.createElementNS(ns,'v');
+      vEl.textContent=String(val);
+      cell.appendChild(vEl);
+      if(isStr)cell.setAttribute('t','str'); else cell.removeAttribute('t');
+    }
+    const rd1=x=>Math.floor(x*10)/10;
+    const A=(q,p)=>Math.round((q||0)*(p||0));
+    const amtOr=(q,p)=>{const a=A(q,p); return a>0?a:'';};   // 0なら数式IF(...)の""に合わせる
+    function findSheetName(part){
+      for(const k in nameToPath){ if(k.trim()===part.trim())return k; }
+      return null;
+    }
+    async function editS(name,fn){ const k=findSheetName(name); if(k)await edit(k,fn); }
+
+    const lenX=v('lenX')||0, lenY=v('lenY')||0, hEave=v('hEave')||0;
+    const dateNum=dateSerial(t('cdate'));
+    const cname=t('cname')||'';
+    // 窓スロットごとの面積(テンプレ数式 ROUNDDOWN(たて×よこ/10000,1) と同じ計算)
+    const slotAreas=[]; let sumH1=0,sumW1=0,sumH2=0,sumW2=0;
+    for(let i=0;i<30;i++){
+      const w=wins[i];
+      const wh=w?(parseFloat(w.h)||0):0, ww=w?(parseFloat(w.w)||0):0;
+      slotAreas.push(rd1(wh*ww/10000));
+      if(i<15){sumH1+=wh;sumW1+=ww;}else{sumH2+=wh;sumW2+=ww;}
+    }
+    const winAreaSum=slotAreas.reduce((s,x)=>s+x,0);
+    const winPerim=rd1((sumH1+sumW1+sumH2+sumW2)*2/100);
+    const winBelow=(sumW1+sumW2)/100;
+    const design=rd1(M.real/0.85);
+    const perim=(lenX*2+lenY*2)/100;
+    const b24=(lenX<800?1:2)*2, b25=(lenY<800?1:2)*2;
+    const scafAmt=A(M.scaf,prices.scaf);
+
+    /* 情報(編集する) */
+    await editS('情報(編集する)',doc=>{
+      setCache(doc,'C6',design);
+      setCache(doc,'C12',perim);
+      setCache(doc,'C14',Math.round(winAreaSum*10)/10);
+      setCache(doc,'C15',winPerim);
+      setCache(doc,'C16',winBelow);
+      for(let i=0;i<30;i++){
+        if(i<15)setCache(doc,'H'+(3+i),slotAreas[i]);
+        else setCache(doc,'L'+(3+i-15),slotAreas[i]);
       }
+      setCache(doc,'F19',sumH1); setCache(doc,'G19',sumW1); setCache(doc,'H19',sumH1+sumW1);
+      setCache(doc,'J19',sumH2); setCache(doc,'K19',sumW2); setCache(doc,'L19',sumH2+sumW2);
+      setCache(doc,'B24',b24); setCache(doc,'B25',b25);
+      const c28=M.real*v('prTanka');
+      setCache(doc,'C28',c28); setCache(doc,'C27',c28*1.1);
+      setCache(doc,'E27',scafAmt+prices.delivery);
+      setCache(doc,'E28',c28-(scafAmt+prices.delivery));
+    });
+
+    /* 塗装3種の詳細(アクリル/シリコン/フッ素) */
+    const paintDefs=[
+      {sheet:'アクリル 詳細①(編集する)', plan:paintPlans[0]},
+      {sheet:'シリコン 詳細①', plan:paintPlans[1]},
+      {sheet:'フッ素 詳細①', plan:paintPlans[2]},
+    ];
+    const paintSubs={};
+    for(const pd of paintDefs){
+      const pl=pd.plan;
+      const g={
+        4:amtOr(M.scaf,prices.scaf), 5:amtOr(M.real,prices.wash), 6:amtOr(M.scaf,prices.mask),
+        7:amtOr(M.joint,prices.seal), 8:amtOr(winPerim,prices.seal), 9:amtOr(M.real,prices.primer),
+        10:amtOr(M.real,pl.mid), 11:amtOr(M.real,pl.top),
+        12:amtOr(M.hafu,prices.hafu), 13:amtOr(M.noki,prices.noki), 14:amtOr(M.gutter,prices.gutter)
+      };
+      let sub=0; for(const r in g){ if(typeof g[r]==='number')sub+=g[r]; }
+      paintSubs[pd.sheet]=sub;
+      await editS(pd.sheet,doc=>{
+        setCache(doc,'D4',M.scaf); setCache(doc,'D5',M.real); setCache(doc,'D6',M.scaf);
+        setCache(doc,'D7',M.joint||0); setCache(doc,'D8',winPerim); setCache(doc,'D9',M.real);
+        setCache(doc,'D10',M.real); setCache(doc,'D11',M.real);
+        setCache(doc,'D12',M.hafu||0); setCache(doc,'D13',M.noki||0); setCache(doc,'D14',M.gutter||0);
+        setCache(doc,'F4',prices.scaf); setCache(doc,'F5',prices.wash); setCache(doc,'F6',prices.mask);
+        setCache(doc,'F7',prices.seal); setCache(doc,'F8',prices.seal); setCache(doc,'F9',prices.primer);
+        setCache(doc,'F12',prices.hafu); setCache(doc,'F13',prices.noki); setCache(doc,'F14',prices.gutter);
+        for(const r in g){ setCache(doc,'G'+r,g[r], typeof g[r]!=='number'); }
+        setCache(doc,'J14',sub);
+        setCache(doc,'G32',sub);
+      });
+    }
+
+    /* サイディング詳細(PR企画/カタログ) */
+    const asG=(cat)=>({
+      4:amtOr(M.scaf,prices.scaf), 5:'',
+      6:amtOr(design,cat?prices.asBodyCat:prices.asBodyPR),
+      7:amtOr(M.corner,prices.corner), 8:amtOr(M.cap,prices.cap),
+      9:amtOr(winPerim,prices.mikiri), 10:amtOr(1,prices.mizukiri),
+      11:amtOr(perim,prices.starter), 12:amtOr(perim,prices.mawaribuchi),
+      13:amtOr(M.real,cat?prices.dobuchiCat:prices.dobuchiPR)
+    });
+    const paintBlock=paintOn?(A(M.hafu,prices.hafu)+A(M.noki,prices.noki)+A(M.gutter,prices.gutter)):0;
+    const i7=((v('qC1F')||0)*hEave/2+(v('qC2F')||0)*hEave/2)/100;
+    const j7=((b24+b25)*hEave)/100;
+
+    await editS('PR企画 詳細①(編集する)',doc=>{
+      setCache(doc,'D4',M.scaf); setCache(doc,'D6',design); setCache(doc,'D9',winPerim);
+      setCache(doc,'D11',perim); setCache(doc,'D12',perim); setCache(doc,'D13',M.real); setCache(doc,'D14',M.real);
+      const g=asG(false);
+      for(const r in g){ setCache(doc,'G'+r,g[r], typeof g[r]!=='number'); }
+      setCache(doc,'G32',pc.pr.sub);
+      setCache(doc,'I7',i7); setCache(doc,'J7',j7);
+      setCache(doc,'I9',perim); setCache(doc,'J9',perim);
+      let ex=0; const gg=asG(false); for(const r in gg){ if(typeof gg[r]==='number')ex+=gg[r]; }
+      ex+=A(M.real,prices.sealAS)+prices.delivery;
+      setCache(doc,'I16',ex); setCache(doc,'J16',ex*0.03);
+    });
+    await editS('カタログ 詳細①',doc=>{
+      setCache(doc,'D4',M.scaf); setCache(doc,'D6',design);
+      setCache(doc,'D7',M.corner||0); setCache(doc,'D8',M.cap||0); setCache(doc,'D9',winPerim);
+      setCache(doc,'D10',1); setCache(doc,'D11',perim); setCache(doc,'D12',perim);
+      setCache(doc,'D13',M.real); setCache(doc,'D14',M.real); setCache(doc,'D15',1);
+      setCache(doc,'F4',prices.scaf); setCache(doc,'F7',prices.corner); setCache(doc,'F8',prices.cap);
+      setCache(doc,'F9',prices.mikiri); setCache(doc,'F10',prices.mizukiri); setCache(doc,'F11',prices.starter);
+      setCache(doc,'F12',prices.mawaribuchi); setCache(doc,'F14',prices.sealAS); setCache(doc,'F15',prices.delivery);
+      const g=asG(true);
+      for(const r in g){ setCache(doc,'G'+r,g[r], typeof g[r]!=='number'); }
+      setCache(doc,'G32',pc.cat.sub);
+    });
+
+    /* 内訳明細書 ×5 */
+    const catAfter=pc.cat.sub-pc.cat.hasu;
+    const breakdowns=[
+      {sheet:'PR企画 内訳明細書', sub:pc.pr.sub, after:pc.pr.after},
+      {sheet:'カタログ 内訳明細書', sub:pc.cat.sub, after:catAfter},
+      {sheet:'アクリル 内訳明細書', sub:paintSubs['アクリル 詳細①(編集する)'], after:paintSubs['アクリル 詳細①(編集する)']},
+      {sheet:'シリコン 内訳明細書', sub:paintSubs['シリコン 詳細①'], after:paintSubs['シリコン 詳細①']},
+      {sheet:'フッ素 内訳明細書', sub:paintSubs['フッ素 詳細①'], after:paintSubs['フッ素 詳細①']},
+    ];
+    for(const b of breakdowns){
+      await editS(b.sheet,doc=>{
+        setCache(doc,'G4',b.sub);
+        setCache(doc,'G20',b.after);
+        setCache(doc,'G21',b.after*0.1);
+        setCache(doc,'G22',b.after*1.1);
+        if(b.sheet==='PR企画 内訳明細書'){
+          setCache(doc,'I19',scafAmt+prices.delivery);
+          setCache(doc,'N19',paintBlock);
+          setCache(doc,'N20',b.after-paintBlock);
+          setCache(doc,'I21',M.real);
+          setCache(doc,'J21',M.real*24000); setCache(doc,'K21',M.real*24500); setCache(doc,'L21',M.real*25000);
+          setCache(doc,'J22',M.real*24000*1.1); setCache(doc,'K22',M.real*24500*1.1); setCache(doc,'L22',M.real*25000*1.1);
+        }
+      });
+    }
+
+    /* 御見積書表紙 ×5 */
+    const covers=[
+      {sheet:'PR企画 御見積書表紙', after:pc.pr.after},
+      {sheet:'カタログ 御見積書表紙', after:catAfter},
+      {sheet:'アクリル 御見積書表紙', after:paintSubs['アクリル 詳細①(編集する)']},
+      {sheet:'シリコン 御見積書表紙', after:paintSubs['シリコン 詳細①']},
+      {sheet:'フッ素 御見積書表紙', after:paintSubs['フッ素 詳細①']},
+    ];
+    for(const c of covers){
+      await editS(c.sheet,doc=>{
+        setCache(doc,'L1',dateNum);
+        setCache(doc,'B7',cname,true);
+        setCache(doc,'G12',c.after*1.1);
+        setCache(doc,'H14',c.after*0.1);
+      });
     }
 
     /* --- 保存 --- */
