@@ -366,7 +366,9 @@ async function saveBlob(blob, filename){
     try{
       const file = new File([blob], filename, {type: blob.type});
       if(!navigator.canShare || navigator.canShare({files:[file]})){
-        await navigator.share({files:[file], title:filename});
+        // 注意: titleやtextを一緒に渡すと、保存先によってはファイル本体ではなく
+        // その文字列がテキストとして保存されてしまうため、ファイルのみを渡す
+        await navigator.share({files:[file]});
         return true;
       }
     }catch(e){
@@ -388,9 +390,10 @@ async function saveBlob(blob, filename){
 }
 
 /* ============ バージョン表示・更新履歴 ============ */
-const APP_VERSION = '1.8.6';
-const APP_UPDATED = '2026-07-29';
+const APP_VERSION = '1.8.7';
+const APP_UPDATED = '2026-07-30';
 const CHANGELOG = [
+  {ver:'1.8.7', date:'2026-07-30', notes:['iPhoneで保存するとExcelではなくファイル名だけのテキストが保存される不具合を修正']},
   {ver:'1.8.6', date:'2026-07-29', notes:['出力Excelにツールの入力値が反映されない(古い数字が表示される)不具合を修正。全数式セルの表示値をツールの計算結果で更新するようにした']},
   {ver:'1.8.5', date:'2026-07-29', notes:['Excelの金額・お客様名などが白紙になる不具合を修正(数式の計算結果を消しすぎていた)']},
   {ver:'1.8.4', date:'2026-07-29', notes:['Excelが正しく表示されない不具合を修正(XML宣言が二重に付いていた)']},
